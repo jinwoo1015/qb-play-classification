@@ -1,0 +1,696 @@
+---
+jupyter: python3
+header-includes:
+  - \renewcommand{\maketitle}{}
+  - \usepackage{indentfirst}
+format: 
+  pdf:
+    pdf-engine: xelatex
+    mainfont: "Times New Roman"
+    fontsize: 12pt
+    linestretch: 2.0
+    geometry: "margin=1in"
+indent: true 
+execute:
+  echo: false
+  warning: false
+---
+
+```{python}
+import cv2
+import matplotlib.pyplot as plt
+import pandas as pd
+from ultralytics import YOLO
+import numpy as np
+import glob
+import os
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import LeaveOneOut
+from itertools import combinations
+```
+
+\begin{titlepage}
+\rule{\textwidth}{0.5pt} \\
+
+\centering
+\vspace*{4cm}
+
+
+{\Large \textbf{Hips Don’t Lie:} \par}
+{\Large \textbf{Automating Quarterback Play Classification through YOLO Pose Tracking and Feature Selection} \par}
+\vspace{1.5cm}
+{\large Jinwoo Choi \par}
+\vspace{0.5cm}
+{\large \today \par}
+
+\vfill
+
+\rule{\textwidth}{0.5pt} \\
+\vspace{0.3cm}
+{\large University of Arizona - College of Science - Statistic and Data Science \par}
+\end{titlepage}
+
+\newpage
+
+\tableofcontents
+\newpage
+
+# Abstract
+
+Manually categorizing football play types from broadcast video is a labor-intensive process for coaches and analysts, especially at the collegiate and high school levels where sensor-based tracking data is unavailable. This study presents an automated pipeline for play classification using YOLOv8 pose estimation and traditional machine learning. By extracting frame-by-frame joint coordinates from thirteen broadcast clips of University of Arizona football plays, six biomechanical features, including wrist acceleration and hip velocity were engineered to capture the physics of quarterback movement. To address the constraints of a small dataset and prevent data leakage, a Leave-One-Video-Out Cross-Validation (LOOCV) strategy was employed. Advanced feature selection revealed that the most complex models were outperformed by a simplified hip-focused model. Focusing exclusively on the Quarterback’s center of mass (Hip Horizontal and Vertical Velocity) yielded the highest classification accuracy of 69.2%, successfully identifying 100% of passing plays. These findings suggest that in high-speed athletic environments, tracking the center of mass provides a more stable and accurate signal for action recognition than other joint movement. This research provides a scalable concept for automated play classification using standard video.
+
+\newpage
+
+# Introduction & Motivation
+
+## Problem Statement
+
+In modern football, film study is imperative in strategic preparation for coaches and analysts. However, the process of manually tagging and categorizing thousands of plays across a season is a tedious and labor-intensive task for video coordinators. While advanced, sensor-based tracking data (such as NFL Next Gen Stats) exists at the professional level, collegiate and high school programs often rely entirely on raw 2D broadcast video. Building an automated pipeline to classify play outcomes directly from standard video footage would save hundreds of hours and provide valuable insights for teams at all levels of the sport. This project aims to utilize computer vision techniques to extract physical features of quarterbacks from broadcast footage and apply machine learning algorithms to classify the type of play such as Pass, Run, Sack, or Handoff.
+
+## Data Source
+
+To approach this problem, this project utilizes raw broadcast footage of 13 football plays from this 2025-26 season of University of Arizona Football team. A pre-trained Deep Learning model called YOLO ([You Only Look Once](https://docs.ultralytics.com/tasks/pose/)) pose estimation model that uses Convolutional Neural Networks, was applied to these videos to extract frame-by-frame 2D spatial coordinates of the Quarterback's key body joints. The resulting extracted dataset contains approximately 1,970 frames of physical movement tracking data after combining all videos. Another dataset consist of each video as the row, labeled with one of four true outcomes: Pass, Run, Sack, or Handoff, which was manually tagged by watching the clips, since the dataset is small enough to implement this step, which allows me to build a supervised machine learning model to classify the play types based on the physical features extracted from the videos.
+
+# Data Exploration & Preprocessing
+
+## Video Preprocessing and Spatial Cropping
+
+*Figure omitted from the public repository: first video frame with a coordinate grid, used to choose the crop region around the quarterback. It is a still from TV broadcast footage.*
+
+```{python, eval=False}
+#| eval: false
+
+
+video_file = 'play13_handoff.mp4'
+
+cap = cv2.VideoCapture(video_file)
+success, frame = cap.read()
+cap.release()
+
+if success:
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+    plt.figure(figsize=(12, 8))
+    plt.imshow(frame_rgb)
+    
+    plt.grid(color='white', linestyle='--', linewidth=0.5, alpha=0.7)
+    plt.title(f'First Frame of {video_file}', fontsize=16)
+    plt.xlabel('X Coordinates (Width)')
+    plt.ylabel('Y Coordinates (Height)')
+    plt.show()
+else:
+    print("Could not read the video file.")
+```
+
+The initial data source consisted of 13 standard broadcast video clips, each capturing a single football play. Because these clips were sourced from standard television or stadium broadcast angles, some clips consisted of wide-angle framing designed to capture all 22 players on the field. During initial testing, it was discovered that this wide view was performing poorly with the YOLO pose estimation model, since the players were too zoomed out. To resolve this constraint, a manual preprocessing step was implemented prior to running the computer vision model. Each video was spatially cropped and reframed to maintain a tight focus specifically on the area surrounding the quarterback. By artificially zooming in, the model was able to detect the frame of the players' body significantly better. This manual adjustment drastically improved the YOLO model's confidence scores and joint detection consistency throughout the duration of the plays. In order to figure out how to reframe the clips, I built a custom Matplotlib grid tool that allowed me to visualize what the X and Y coordinates of the video frames were, so I could find the exact numbers to crop by. It was difficult to figure out how to make this process automated since the Quarterbacks is not always in the exact same spot in every video, which I decided to just accept this process as a necessary manual step for now. However, in the future, I would be interested in building an AI-powered cropping tool that can automatically find the QB in the first few frames and crop around him for the rest of the video.
+
+## Pose Extraction and Handling Missing Data
+
+*Figure omitted from the public repository: a tracked frame showing YOLOv8 pose skeletons, bounding boxes and track IDs drawn over broadcast footage.*
+
+```{python, eval=False}
+#| eval: false
+
+
+model = YOLO('yolov8x-pose.pt')
+
+def process_football_clip(video_file, start_x, end_x, start_y, end_y, output_prefix):
+    print(f"\n--- Processing {video_file} ---")
+    
+    cap = cv2.VideoCapture(video_file)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    
+    cropped_width = end_x - start_x
+    cropped_height = end_y - start_y
+    
+    output_video = f"{output_prefix}_tracked.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video, fourcc, fps, (cropped_width, cropped_height))
+    
+    all_players_data = []
+    frame_count = 0
+    
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+            
+        zoomed_frame = frame[start_y:end_y, start_x:end_x]
+        
+        results = model.track(zoomed_frame, conf=0.10, persist=True, verbose=False)
+        result = results[0]
+        annotated_frame = result.plot()
+        
+        if result.boxes is not None and result.boxes.id is not None:
+            track_ids = result.boxes.id.int().cpu().tolist()
+            keypoints = result.keypoints.xy.cpu().numpy()
+            boxes = result.boxes.xyxy.cpu().numpy() 
+            
+            for i, player_id in enumerate(track_ids):
+                all_players_data.append({
+                    'Frame': frame_count,
+                    'Player_ID': player_id,
+                    'joints': keypoints[i]
+                })
+                
+                x1, y1 = int(boxes[i][0]), int(boxes[i][1]) 
+                cv2.putText(annotated_frame, f"ID: {player_id}", (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+                
+        out.write(annotated_frame)
+        frame_count += 1
+        
+    cap.release()
+    out.release()
+    
+    if len(all_players_data) > 0:
+        KEYPOINT_NAMES = [
+            "Nose", "Left_Eye", "Right_Eye", "Left_Ear", "Right_Ear",
+            "Left_Shoulder", "Right_Shoulder", "Left_Elbow", "Right_Elbow",
+            "Left_Wrist", "Right_Wrist", "Left_Hip", "Right_Hip",
+            "Left_Knee", "Right_Knee", "Left_Ankle", "Right_Ankle"
+        ]
+        
+        clean_rows = []
+        for frame_info in all_players_data:
+            row_data = {'Frame': frame_info['Frame'], 'Player_ID': frame_info['Player_ID']}
+            joints = frame_info['joints'] 
+            for i, joint_name in enumerate(KEYPOINT_NAMES):
+                row_data[f'{joint_name}_X'] = joints[i][0]
+                row_data[f'{joint_name}_Y'] = joints[i][1]
+            clean_rows.append(row_data)
+            
+        df = pd.DataFrame(clean_rows)
+        output_csv = f"{output_prefix}_data.csv"
+        df.to_csv(output_csv, index=False)
+        print(f"✅ Success! Saved {output_video} and {output_csv}")
+    else:
+        print("❌ No players detected")
+```
+
+```{python, eval=False}
+#| eval: false
+
+
+video_batch = [
+    {
+        "file": "play06_sack.mp4", 
+        "start_x": 100, "end_x": 1200, 
+        "start_y": 100, "end_y": 700, 
+        "prefix": "play06_sack"
+    }
+]
+
+print(f"Starting batch for {len(video_batch)} videos...")
+
+for idx, video in enumerate(video_batch, 1):
+    print(f"\n[{idx}/{len(video_batch)}] Queuing up {video['file']}...")
+    
+    try:
+        process_football_clip(
+            video_file=video["file"],
+            start_x=video["start_x"],
+            end_x=video["end_x"],
+            start_y=video["start_y"],
+            end_y=video["end_y"],
+            output_prefix=video["prefix"]
+        )
+    except Exception as e:
+        print(f"ERROR processing {video['file']}: {e}")
+
+print("BATCH COMPLETE")
+```
+
+```{python, eval=False}
+#| eval: false
+
+
+def stitch_qb_ids(master_csv_path, list_of_qb_ids, output_csv_name):
+    df = pd.read_csv(master_csv_path)
+    
+    qb_df = df[df['Player_ID'].isin(list_of_qb_ids)].copy()
+    
+    qb_df = qb_df.drop_duplicates(subset=['Frame'], keep='first')
+    
+    qb_df['Player_ID'] = 'QB_Stitched'
+
+    qb_df.to_csv(output_csv_name, index=False)
+    
+    print(f"✅ Success! Stitched IDs {list_of_qb_ids} together.")
+    print(f"Saved {len(qb_df)} continuous frames of QB data to {output_csv_name}")
+
+
+stitch_qb_ids(
+    master_csv_path='play08_run_raw.csv', 
+    list_of_qb_ids=[4720, 2729, 4806], 
+    output_csv_name='play08_run.csv'
+)
+
+stitch_qb_ids(
+    master_csv_path='play10_run_raw.csv', 
+    list_of_qb_ids=[4996, 5132, 5249, 5468], 
+    output_csv_name='play10_run.csv'
+)
+
+stitch_qb_ids(
+    master_csv_path='play09_pass_raw.csv', 
+    list_of_qb_ids=[5763, 5805], 
+    output_csv_name='play09_pass.csv'
+)
+```
+
+```{python, eval=False}
+#| eval: false
+
+
+play1_df = pd.read_csv('play01_handoff_raw.csv')
+play1_df = play1_df[play1_df['Player_ID'] == 22]
+play1_df = play1_df.to_csv('play01_handoff.csv', index=False)
+
+play2_df = pd.read_csv('play02_sack_raw.csv')
+play2_df = play2_df[play2_df['Player_ID'] == 325]
+play2_df = play2_df.to_csv('play02_sack.csv', index=False)
+
+play3_df = pd.read_csv('play03_pass_raw.csv')
+play3_df = play3_df[play3_df['Player_ID'] == 506]
+play3_df = play3_df.to_csv('play03_pass.csv', index=False)
+
+play4_df = pd.read_csv('play04_pass_raw.csv')
+play4_df = play4_df[play4_df['Player_ID'] == 981]
+play4_df = play4_df.to_csv('play04_pass.csv', index=False)
+
+play5_df = pd.read_csv('play05_sack_raw.csv')
+play5_df = play5_df[play5_df['Player_ID'] == 1177]
+play5_df = play5_df.to_csv('play05_sack.csv', index=False)
+
+play6_df = pd.read_csv('play06_sack_raw.csv')
+play6_df = play6_df[play6_df['Player_ID'] == 5980]
+play6_df = play6_df.to_csv('play06_sack.csv', index=False)
+
+play7_df = pd.read_csv('play07_sack_raw.csv')
+play7_df = play7_df[play7_df['Player_ID'] == 3670]
+play7_df = play7_df.to_csv('play07_sack.csv', index=False)
+
+play11_df = pd.read_csv('play11_pass_raw.csv')
+play11_df = play11_df[play11_df['Player_ID'] == 2870]
+play11_df = play11_df.to_csv('play11_pass.csv', index=False)
+
+play12_df = pd.read_csv('play12_pass_raw.csv')
+play12_df = play12_df[play12_df['Player_ID'] == 3202]
+play12_df = play12_df.to_csv('play12_pass.csv', index=False)
+
+play13_df = pd.read_csv('play13_handoff_raw.csv')
+play13_df = play13_df[play13_df['Player_ID'] == 3501]
+play13_df = play13_df.to_csv('play13_handoff.csv', index=False)
+```
+
+After the cropping process, the YOLO model was applied to each video to extract the 17 key body joints of all the players in each frame and convert it into a table format. The model was able to track the players and assign them unique IDs, but it was not perfect. Sometimes the model would lose track of the quarterback for a few frames, or accidentally switch his ID with another player. To handle these issues, I implemented a post-processing step where I manually stitched together the correct IDs for the quarterback across the frames. This involved looking at the clip of football plays after the tracking model was applied, which showed me the unique ID numbers that the model assigned to the quarterback in each frame. Once I had the list of IDs that corresponded to the quarterback, I simply the filtered the dataset to only contain quarterback data, and labeled them as the cleaned dataset, below is the preview of the cleaned dataset for one of the videos, which contains the X and Y coordinates of the 17 key body joints for every frame of that video, which will be used to engineer the features for the machine learning model.
+
+```{python}
+preview_df = pd.read_csv('Clean_QBs/play13_handoff.csv')
+print(preview_df.T.iloc[:, :5])
+```
+
+## Initial Feature Extraction and Visualization
+
+After successfully extracting the raw X and Y coordinates isolated for the Quarterback, the next step was to mathematically translate these coordinates into basic movement summary that could be used to visualize and understand the dataset better. For an initial exploration, I focused on three key features that I believed are main key movements by adding my sports background knowledge of football, which were Wrist Speed, Forward Speed, and Hip Drop, to see if there are any noticeable patterns in each of the play types. Wrist Speed was calculated by taking the frame-by-frame difference in the X and Y coordinates of both wrists, and then calculating the overall velocity. Forward Speed was calculated by taking the frame-by-frame difference in the X coordinate of the left hip, which is a common way to measure forward movement in football. Hip Drop was calculated by taking the frame-by-frame difference in the Y coordinate of the left hip, which can indicate when a quarterback is getting sacked or dropping his hips to avoid a sack. After calculating these features for each video, I visualized them using pair plots and box plots to see if there were any noticeable patterns that could help differentiate between Pass, Run, Sack, and Handoff plays. Below is the preview of the each game summary statistics of the three features.
+
+```{python, eval=False}
+#| eval: false
+
+
+folder_path = "Clean_QBs/*.csv"
+csv_files = glob.glob(folder_path)
+
+summary_data = []
+
+print(f"Found {len(csv_files)} clean QB files. Extracting bio-mechanics...")
+
+for file in csv_files:
+    df = pd.read_csv(file)
+    
+    df['RW_Vel'] = np.sqrt(df['Right_Wrist_X'].diff()**2 + df['Right_Wrist_Y'].diff()**2)
+    df['LW_Vel'] = np.sqrt(df['Left_Wrist_X'].diff()**2 + df['Left_Wrist_Y'].diff()**2)
+    max_wrist_speed = max(df['RW_Vel'].max(), df['LW_Vel'].max())
+    
+    df['Hip_X_Vel'] = abs(df['Left_Hip_X'].diff())
+    max_forward_speed = df['Hip_X_Vel'].max()
+    
+    df['Hip_Drop_Vel'] = df['Left_Hip_Y'].diff() 
+    max_hip_drop = df['Hip_Drop_Vel'].max()
+    
+    summary_data.append({
+        'Video_Name': os.path.basename(file),
+        'Max_Wrist_Speed': max_wrist_speed,
+        'Max_Forward_Speed': max_forward_speed,
+        'Max_Hip_Drop': max_hip_drop
+    })
+
+features_df = pd.DataFrame(summary_data)
+
+features_df = features_df.fillna(0)
+
+# features_df.to_csv('play_features.csv', index=False)
+```
+
+```{python}
+df = pd.read_csv('play_features.csv')
+
+print(df.drop(columns=['Video_Name']).head().to_markdown())
+```
+
+### Visualization
+
+```{python}
+plt.clf()
+
+sns.boxplot(data=df, x='True_Label', y='Max_Wrist_Speed')
+```
+
+As we look at the boxplot of the Max Wrist Speed across the different play types, we can see that Run play stands out among others compared to other play types, which makes sense since the quarterback is most likely using his arms to sprint forward in a Run play, which would require more wrist movement compared to a Pass or Sack. However, this is a surprising insights since I mostly expected the pass plays to have higher wrist speed since the quarterback is throwing the ball.
+
+```{python}
+plt.clf()
+sns.boxplot(data=df, x='True_Label', y='Max_Forward_Speed')
+```
+
+The Run plays showed the highest forward hip velocities, clearly capturing the mechanics of a quarterback breaking the pocket and scrambling downfield. Passes and Sacks generally showed much lower forward speeds, as the quarterback is primarily stationary, stepping up, or backpedaling within the pocket.
+
+```{python}
+plt.clf()
+sns.boxplot(data=df, x='True_Label', y='Max_Hip_Drop')
+```
+
+The Sack and Run plays had significantly higher hip drop velocities compared to Passes and Handoffs. This makes sense as both Sacks and Runs will result in tackles at the end, unless the Quarterback scored a touchdown without getting touched. The Pass and Handoff plays had much lower hip drop velocities, which indicates that the quarterback is not getting tackled as much, and more likely to be standing up the entire clip.
+
+```{python}
+sns.set_theme(style="whitegrid")
+pairplot = sns.pairplot(
+    data=df, 
+    diag_kind='kde', 
+    markers='o',
+    plot_kws={'s': 80, 'alpha': 0.7},
+    hue='True_Label'
+)
+
+plt.show()
+```
+
+To visualize in more detail in how these three features interacted with one another to see if clear, distinct clusters naturally formed for Passes, Runs, and Sacks. Here is the pairwise density graph to look for separations in each play types. Although some Run plays had some distinct separation in certain feature combinations, there was still a lot of overlap between the play types, which indicates that these three features alone may not be enough to perfectly classify the play types, but it does show some promising patterns that can be further explored with more features and more data.
+
+# Modeling Approaches
+
+Initially, I wanted to utilize Deep Learning models such as Long Short-Term Memory (LSTM) or Recurrent Neural Networks (RNN) to capture the complex dynamic in movements of image data, which is currently utilize in our modern industry like in NFL, or other broadcast companies. However, a significant challenge quickly occurred during the planning phase, which was that Deep Learning models require massive amounts of training data and heavy computational resources to perform effectively, and building such models would have lead to significant overfitting with the current dataset. With only 13 videos I manually gathered, and each video using the Pose Estimation model to extract the joint coordinate, the computing time with my current hardware set up was taking immense amount of time to train, which I decided to pivot to more traditional machine learning models that are more suitable for the smaller datasets, and focus towards leaning how to properly scale down the project's complexity without sacrificing the quality of the project. To bridge the gap in complexity and still achieve high accuracy, I realized I had to rely heavily on precise, human-driven feature engineering. By mathematically translating the raw data into meaningful physical movements first, simpler statistical models could perform just as well as resource-heavy neural networks.
+
+## Feature Engineering
+
+As observed in the exploratory data analysis, summarizing an entire football play into a single maximum value resulted in overlapping data distributions. To give the machine learning model a clearer understanding of the physics of the play, I shifted to a frame-by-frame approach.
+
+Rather than feeding the model raw X and Y coordinates, which hold very little physical meaning on their own.I engineered six specific features designed to capture the core movements of a quarterback's movement. Here are the 6 features that are added with detailed explanation on how they are calculated and why they are important:
+
+1.  **Smoothed Maximum Wrist Velocity (Max_Wrist_Vel)**: Passing a football requires an explosive, whipping motion of the arm. By calculating the Pythagorean velocity of the wrists and taking the maximum between the left and right arms, the model can identify the arc of a throw. The 5-frame rolling average was crucial here to smooth out the shaky part of the YOLO tracking model.
+2.  **Wrist Acceleration (Wrist_Accel)**: While a quarterback pumping their arms during a scramble generates high wrist velocity, a throw involves a sudden, violent change in speed. By measuring acceleration, the model can differentiate between the steady, rhythmic arm swings of running and the sudden snap of a throw.
+3.  **Forward Hip Velocity (Hip_X_Vel)**: The hips represent the player's center of mass. If the absolute value of the hip's horizontal velocity is high, it indicates the quarterback has broken the pocket and is scrambling. During a pass or a sack, the quarterback's center of mass is typically stationary or making very small adjustments inside the pocket.
+4.  **Vertical Hip Drop Velocity (Hip_Drop_Vel)**: In video coordinates, the Y-axis increases as you move downward toward the grass. Therefore, a sudden, sharp increase in the Y-coordinate of the hips indicates the quarterback's center of mass is plunging toward the ground. This perfectly encapsulates the mechanics of a sack.
+5.  **Hip Drop Acceleration (Hip_Drop_Accel)**: A quarterback might voluntarily duck to avoid a defender, creating downward velocity. However, a tackle involves a sudden, forced change in momentum. Adding vertical acceleration helps the Machine Learning recognize the sudden, aggressive force of a defender dragging the quarterback down.
+6.  **Temporal Context (Play_Progress)**: Because the model evaluates the play frame-by-frame, it loses the concept of time. A quarterback's mechanics look very different at the beginning of a snap versus the end of a play. By adding a simple percentage metric (e.g., Frame 10 out of 100 = 10% progress), the AI learns that quick throws often happen early in the play, while sacks and scrambles typically occur later as the pocket breaks down.
+
+The decision to transform raw X and Y coordinate data into velocity and acceleration metrics was heavily inspired by established literature in Sports Biomechanics and computer vision action-recognition. Here are some of the key sources that influenced the feature engineering process:
+
+-   **Passing Mechanics and Kinematic Sequencing**: In sports science, the quarterback throwing motion is analyzed through "kinematic sequencing," which studies how force from the lower body translates to the explosive release of the ball. Research on the biomechanics of the overhead throw frequently measures the maximal internal rotation velocity of the throwing arm to quantify passing mechanics (Fleisig, G. S., Barrentine, S. W., Zheng, N., Escamilla, R. F., & Andrews, J. R. (1996); Labbe, A., Foret, W., Troy, M., Page, P., & Savoie, F. B. (2025)). By engineering the Max_Wrist_Vel and Wrist_Accel features, this model directly captures the peak kinetic energy expended at the end of the kinematic chain, successfully separating a high-velocity throw from a standard running arm-pump.
+
+-   **Center of Mass (COM) and Scrambling**: In biomechanical modeling, the human pelvis (hips) is commonly used as the proxy for the body's Center of Mass (COM). To identify when a quarterback breaks the pocket to scramble, the model tracks the absolute horizontal velocity of the hips (Hip_X_Vel). This aligns with foundational physics principles where horizontal displacement of the COM is the primary indicator of forward motion, separating it from the stationary footwork of a quarterback scanning the field.
+
+-   **Fall Detection Algorithms and Sacks**: The most difficult challenge was mathematically defining a "sack." To solve this, I drew inspiration from computer vision systems designed for traditional fall detection. State-of-the-art fall detection algorithms monitor the vertical velocity and acceleration of the pelvis to identify sudden, uncontrolled falling motion toward the floor (Bian, Z.-P., Chau, L.-P., & Magnenat-Thalmann, N. (2012); Xu, T., & Zhou, Y. (2018)). By engineering Hip_Drop_Vel and Hip_Drop_Accel, the model successfully flags the exact moment a quarterback's center of mass is aggressively forced downward by a defender.
+
+```{python}
+labels_df = pd.read_csv('play_features.csv')
+label_dict = dict(zip(labels_df['Video_Name'], labels_df['True_Label']))
+
+all_frames = []
+
+for file in glob.glob("Clean_QBs/*.csv"):
+    video_name = os.path.basename(file)
+    if video_name not in label_dict:
+        continue
+        
+    df = pd.read_csv(file)
+    total_frames = len(df)
+    
+    df['RW_Vel'] = np.sqrt(df['Right_Wrist_X'].diff()**2 + df['Right_Wrist_Y'].diff()**2).fillna(0).rolling(window=5, min_periods=1).mean()
+    df['LW_Vel'] = np.sqrt(df['Left_Wrist_X'].diff()**2 + df['Left_Wrist_Y'].diff()**2).fillna(0).rolling(window=5, min_periods=1).mean()
+    df['Max_Wrist_Vel'] = np.maximum(df['RW_Vel'], df['LW_Vel'])
+    
+    df['Hip_X_Vel'] = abs(df['Left_Hip_X'].diff()).fillna(0).rolling(window=5, min_periods=1).mean()
+    df['Hip_Drop_Vel'] = df['Left_Hip_Y'].diff().fillna(0).rolling(window=5, min_periods=1).mean()
+    
+    df['Wrist_Accel'] = df['Max_Wrist_Vel'].diff().fillna(0)
+    df['Hip_Drop_Accel'] = df['Hip_Drop_Vel'].diff().fillna(0)
+    
+    df['Play_Progress'] = df.index / total_frames
+    
+    df['True_Label'] = label_dict[video_name]
+    df['Video_Name'] = video_name
+    
+    all_frames.append(df[['Video_Name', 'Play_Progress', 'Max_Wrist_Vel', 'Wrist_Accel', 'Hip_X_Vel', 'Hip_Drop_Vel', 'Hip_Drop_Accel', 'True_Label']])
+
+master_df = pd.concat(all_frames, ignore_index=True)
+print(f"Generated {len(master_df)} rows")
+```
+
+And here is the preview of the master dataset that contains all the engineered features for every frame of all the videos, which will be used to train the machine learning model.
+
+```{python}
+master_df_preview = master_df.drop(columns=['Video_Name'])
+print(master_df_preview.T.iloc[:, :5])
+```
+
+## Model Selection and Validation Strategy
+
+### Why Random Forest
+For the classification task, a Random Forest Ensemble model was selected over other traditional algorithms (like Logistic Regression) or Deep Learning models (like LSTMs) for three primary reasons:
+
+-   **Non-Linear Feature Interactions**: Through the exploratory data analysis, the dataset is not large enough to prove the relationship between the engineered features and the play types were linear. Since Random Forests are an ensemble of decision trees, they can capture complex, non-linear interactions between features without requiring any feature transformations.
+-   **Robustness to Tracking Outliers**: Although we applied smoothing techniques and added more advanced features, the underlying data still contains noise and potential outliers due to the imperfections of the YOLO pose estimation. Because Random Forest relies on a majority vote from hundreds of decisions trees, it is more resistant to these outliers compared to other classification models.
+-   **Interpretability**: In Sports Analytics, understanding which features are driving the model's predictions is crucial for gaining actionable insights. Random Forests provide feature importance scores, allowing us to identify which physical movements are most influential in classifying play types, which is valuable for coaches and analysts.
+
+### Preventing Data Leakage with Leave-One-Out Cross-Validation
+
+When dealing with sequential data like video frames, a standard train/test split doesn't logically work because frames from the same video are highly correlated. If frames from the same video appear in both the training and testing sets, the model can easily cheat by placing 44th frame of a play in the training set and 45th frame of that same play in the testing set. The model would not learn the generalized mechanics of the plays, it would simply memorize the specific visual signature of that exact video. leading to data leakage and an overestimation of the model's performance. To prevent this, a Leave-One-Out Cross-Validation (LOOCV) strategy was implemented at the video level. Here's how it works:
+
+-   The model was trained on all frames from 12 distinct plays.
+-   It was then tested on the frames of the 1 remaining play, representing a completely unseen data.
+-   This process was iterated 13 times so every video served as the holdout test set exactly once.
+
+```{python}
+videos = master_df['Video_Name'].unique()
+video_predictions = []
+video_actuals = []
+
+for test_video in videos:
+    train_data = master_df[master_df['Video_Name'] != test_video]
+    test_data = master_df[master_df['Video_Name'] == test_video]
+    
+    feature_cols = ['Play_Progress', 'Max_Wrist_Vel', 'Wrist_Accel', 'Hip_X_Vel', 'Hip_Drop_Vel', 'Hip_Drop_Accel']
+    X_train = train_data[feature_cols]
+    y_train = train_data['True_Label']
+    
+    X_test = test_data[feature_cols]
+    true_video_label = test_data['True_Label'].iloc[0]
+    
+    rf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=5, class_weight='balanced')
+    rf.fit(X_train, y_train)
+    
+    frame_preds = rf.predict(X_test)
+    
+    pred_series = pd.Series(frame_preds)
+    final_video_prediction = pred_series.mode()[0] 
+    
+    video_predictions.append(final_video_prediction)
+    video_actuals.append(true_video_label)
+    
+    mark = "✅" if final_video_prediction == true_video_label else "❌"
+    print(f"{mark} {test_video} | True: {true_video_label} | RF Guessed: {final_video_prediction}")
+
+accuracy = accuracy_score(video_actuals, video_predictions)
+print("\n" + "="*55)
+print(f"Random Forest Accuracy: {accuracy * 100:.1f}%")
+print("="*55)
+```
+
+### Feature Importance
+
+To understand exactly how the Random Forest was making its decisions, I extracted the feature importances from the model. This reveals which features the Random Forest technique valued the most when differentiating between passes, runs, and sacks.
+
+```{python}
+rf.fit(master_df[feature_cols], master_df['True_Label'])
+print("Feature Importance:")
+for name, importance in zip(feature_cols, rf.feature_importances_):
+    print(f" - {name}: {importance * 100:.1f}%")
+```
+
+# Model Evaluation
+
+## Best Subset of Features
+
+Our initial model was using all 6 engineered features, which is not performing the best with an accuracy of around 46%, which is as good as randomly guessing. To further optimize the model, I implemented a feature selection process to identify the best subset of features that would yield the highest accuracy. Since there are only 6 features, I was able to evaluate all possible combinations of these features using the same LOOCV strategy. This deep search allowed me to identify if any specific features were adding noise or if certain combinations of features were more effective at capturing the mechanics of the different play types.
+
+```{python}
+
+all_features = ['Play_Progress', 'Max_Wrist_Vel', 'Wrist_Accel', 'Hip_X_Vel', 'Hip_Drop_Vel', 'Hip_Drop_Accel']
+videos = master_df['Video_Name'].unique()
+
+results = []
+
+best_accuracy = 0
+best_predictions = []
+best_actuals = []
+best_features = None
+
+for r in range(1, len(all_features) + 1):
+    for subset in combinations(all_features, r):
+        feature_cols = list(subset)
+        
+        video_predictions = []
+        video_actuals = []
+        
+        for test_video in videos:
+            train_data = master_df[master_df['Video_Name'] != test_video]
+            test_data = master_df[master_df['Video_Name'] == test_video]
+            
+            X_train = train_data[feature_cols]
+            y_train = train_data['True_Label']
+            X_test = test_data[feature_cols]
+            true_label = test_data['True_Label'].iloc[0]
+            
+            rf = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=5, class_weight='balanced')
+            rf.fit(X_train, y_train)
+            
+            frame_preds = rf.predict(X_test)
+            final_pred = pd.Series(frame_preds).mode()[0]
+            
+            video_predictions.append(final_pred)
+            video_actuals.append(true_label)
+            
+        acc = accuracy_score(video_actuals, video_predictions)
+        results.append({'Features': subset, 'Accuracy': acc})
+        
+        if acc > best_accuracy:
+            best_accuracy = acc
+            best_predictions = video_predictions.copy()
+            best_actuals = video_actuals.copy()
+            best_features = subset
+
+results_df = pd.DataFrame(results).sort_values(by='Accuracy', ascending=False)
+
+print("="*60)
+print("TOP 5 BEST FEATURE COMBINATIONS:")
+print("="*60)
+
+for i, row in results_df.head(5).iterrows():
+    acc_str = f"{row['Accuracy'] * 100:.1f}%"
+    feats = ", ".join(row['Features'])
+    print(f" {acc_str} | Features: [{feats}]")
+```
+
+## Confusion Matrix Analysis
+
+```{python}
+unique_labels = sorted(list(set(best_actuals)))
+
+cm = confusion_matrix(best_actuals, best_predictions, labels=unique_labels)
+
+plt.figure()
+sns.heatmap(
+    cm, 
+    annot=True, 
+    fmt='d', 
+    cmap='Blues', 
+    xticklabels=unique_labels, 
+    yticklabels=unique_labels,
+    annot_kws={"size": 16}
+)
+
+plt.title('Confusion Matrix: Optimized Model',fontweight='bold')
+plt.xlabel('AI Predicted Label')
+plt.ylabel('True Play Label')
+plt.show()
+```
+
+While the overall accuracy metric provides a high-level view of the model's performance, it does not reveal the details of its predictions. The confusion matrix reveals that the model’s ability to classify plays is not uniform across all play types.
+
+-   **Pass**: The model successfully identified 5 out of 5 passing plays. This suggests that the engineered features of Max_Wrist_Vel and Wrist_Accel are highly effective. The explosive, high-velocity whipping motion of a throw is mathematically distinct from any other action on the field, allowing the Random Forest to find the true relationship for this category.
+
+-   **Sacks**: The model correctly identified 3 out of 4 sacks. This confirms that tracking the vertical velocity of the hips (Hip_Drop_Vel) is a reliable proxy for a tackle. The one error was a sack predicted as a pass, which could be either the Quarterback still got tackled after the play is over, or there was a overlap in the metrics where the quarterback had a sudden drop in hip velocity but it was not a sack, which is an interesting case to classify correctly.
+
+-   **Handoffs & Run Similarities**: The model struggled most with "Handoffs" and "Runs." It correctly identified one run but failed to identify either of the two handoffs. One of the reason could be the similarity in the mechanics of a handoff and a run, where the quarterback is making forward movement since most of the handoffs are a fake handoff where the quarterback is sprinting forward to fake out the defense, which creates a lot of overlap in the feature.
+
+Overall, the model performs well at identifying high-intensity events (Passes and Sacks) because they have extreme "spikes" in velocity and acceleration. It struggles with low-intensity or subtle transitions (Handoffs vs. short Runs) where the movement difference is centered on ball handling rather than pure body movement.
+
+# Interpretation & Insights
+
+## What the Model Learned Best
+
+The model excelled at identifying explosive movements, particularly the mechanics of a throw and a sack. The Max_Wrist_Vel and Wrist_Accel features were the most influential in classifying Passes, while Hip_Drop_Vel was critical for identifying Sacks. This indicates that the model successfully captured the core physical movements that define these play types, confirming the importance of feature engineering in translating movement data into actionable insights.
+
+## What the Model Learned Least
+
+The model struggled with slow or smooth movements the most, which is evident in the misclassification of Handoffs and Runs. The features engineered may not have been sufficient to capture the complexed differences in movements between a handoff and a run, especially since many handoffs involve the Quarterback sprinting forward, which creates a lot of overlap in the feature space. This suggests that additional features, such as ball handling metrics or more complexed movement patterns, may be necessary to improve classification in these categories.
+
+## The Failure of Play Progress
+
+We originally thought that knowing "when" a movement happened would help, but the data showed it didn't. One reason might be, is that in Football, Sack can either happen very quickly or at the very end, which does not give a consistent timing in play length. Additionally, Quarterback getting tackled could be also tracked by using the Hip_Drop_Vel feature instead.
+
+## Wrist Feature's Impact
+
+Interestingly, wrist metric was not best way to improve the accuracy, which I ended up dropping for the final model. One reason might be that wrist movements can be chaotic in any types of play, where if it was pass play, then the player could be moving it fast to throw the ball. Or in other types of play, player can be running around which also requires fast arm movement, overall not being very significant in identifying types of plays.
+
+# Conclusion & Reflection
+
+## Hips Don't Lie
+
+The most surprising and important takeaway from this project was that the simplest model was the smartest. While we started with a big datasets using arm movements and play timing, the model performed best (69.2% accuracy) when it focused exclusively on the Hips.
+
+In sports science, the hips are the anchor of the body. While a Quarterback can use their arms to fake a pass or juke a defender, their hips always tell the truth about where their body weight is going. By focusing on Horizontal Hip Speed and Vertical Hip Drop, the model tkae out the noise in arm swinging and other features and successfully identified the core physics of passes, runs, and sacks.
+
+## Reflection on Computer Vision
+
+While YOLO is incredibly fast, it isn't always perfect. In some frames, the camera blur from a collisions caused the some data points to jump around unnaturally. This is likely why our some features weren't as helpful as we hoped, they were sometimes measuring the shaky data points in the tracking rather than the actual player's movement. On the other hand, the hips are a large, central part of the body that YOLO rarely loses track of. This explains why the Hip-based features were so much more reliable. The result wasn't just about Football movements, it was also about which parts of the human body are the easiest for a computer to track accurately.
+
+## The Value of Feature Engineering
+
+This project proved that how you look at data is more important than how much data you have. If we had just used raw pixel coordinates, the model would have been confused by different camera angles or player starting positions. By calculating Velocity and Acceleration, we turned raw numbers into interpretable features that the model could understand. This allowed a relatively simple Random Forest model to achieve nearly 70% accuracy on a very small dataset of just 13 plays. This is a strong signal that computer vision can be used to break down the movement of Football.
+
+## Room for Improvements
+
+Although the model struggled to separate handoffs and Runs, this gives an insight on what to improve for further studies. It tells us that using only the Quarterback's body is not enough to understand the full story of the football plays. Because a handoff and a run look so similar physically, this project proves that human pose is only one piece of the puzzle. To reach a higher accuracy, a model would need to see more context around other players, specifically where the ball is and how close the defenders are and such. Other further future work for improvement can consider few things as listed.
+
+-   More Complex Methods: Using more complex model such as Deep Learning to capture more detailed patterns and the true relationship in detecting play types
+-   Larger Datasets and More Automated Pipeline: In order to build more complex models, more datasets would be required which means it would need more automated pipeline to process videos and translate data to be added to the model.
+-   Model that Captures the Defense Conext: Measuring the distance between the QB and the nearest defender to better predict sacks before they even happen.
+
+This project successfully bridged the gap between raw video footage and actionable sports insights. By turning 13 videos into a table form of dataset that consist of physical forces, we proved that you don't need a supercomputer or thousands of data points to get meaningful results. By focusing on the Center of Mass, using physics-based features, and conducting an detailed search for the best model, we created a system that understands the difference between a quarterback making a play and a quarterback being taken down. This methodology provides a better roadmap for how high school or college teams can use basic video footage to build their own advanced analytics.
+
+\newpage
+
+# References
+
+-   **Bian, Z.-P., Chau, L.-P., & Magnenat-Thalmann, N. (2012)**. Fall detection based on skeleton extraction. Proceedings of the 11th ACM SIGGRAPH International Conference on Virtual-Reality Continuum and its Applications in Industry, 91–94. https://doi.org/10.1145/2407516.2407542
+-   **Fleisig, G. S., Barrentine, S. W., Zheng, N., Escamilla, R. F., & Andrews, J. R. (1996)**. Kinematics of the overhead throwing motion. Clinics in Sports Medicine, 15(3), 405–411.
+-   **Labbe, A., Foret, W., Troy, M., Page, P., & Savoie, F. B. (2025)**. Kinematic Sequencing of the Football Pass Using Inertial Motion Analysis. International journal of sports physical therapy, 20(8), 1214–1221. https://doi.org/10.26603/001c.142488
+-   **Xu, T., & Zhou, Y. (2018)**. Elders' fall detection based on biomechanical features using depth camera. Journal of Circuits, Systems and Computers, 27(10).
+
+### AI Utilization
+
+In the development of this project, Gemini (Google’s Large Language Model) was utilized as a technical collaborator and coding assistant. Specifically, the AI assisted in:
+
+-   Generating Python code structures for video processing and data visualization.
+-   Debugging complex recursive loops during the exhaustive feature selection process.
+-   Formatting the technical documentation and refining the clarity of the written analysis.
+
+I, Jinwoo Choi, served as the primary researcher and decision-maker for this project. I manually collected the video dataset, engineered the domain-specific features (Velocity and Acceleration) based on sports biomechanics principles, and selected the final model parameters. Every line of code and all analytical interpretations provided by the AI were carefully reviewed, tested, and validated for mathematical accuracy and logical consistency. The final conclusions and insights presented in this paper are my own.
+

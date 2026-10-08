@@ -1,0 +1,9 @@
+*.mp4
+*.avi
+*.mov
+*.pt
+.venv/
+.quarto/
+*_files/
+__pycache__/
+.DS_Store
