@@ -4,6 +4,10 @@ Classifying football plays (pass, run, sack, handoff) from standard TV broadcast
 
 Jinwoo Choi, University of Arizona, Statistics and Data Science (DATA 474 final project).
 
+[![Hips Don't Lie: 20 second overview](media/hips-dont-lie.gif)](media/hips-dont-lie.mp4)
+
+*Click for the full video with sound.*
+
 ## Result
 
 | Metric | Value |
